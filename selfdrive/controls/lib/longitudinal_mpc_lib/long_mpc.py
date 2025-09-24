@@ -39,7 +39,7 @@ J_EGO_COST = 5.0
 A_CHANGE_COST = 200.
 DANGER_ZONE_COST = 100.
 CRASH_DISTANCE = .25
-LEAD_DANGER_FACTOR = 0.35
+LEAD_DANGER_FACTOR = 0.75
 LIMIT_COST = 1e6
 ACADOS_SOLVER_TYPE = 'SQP_RTI'
 
@@ -54,7 +54,7 @@ T_IDXS = np.array(T_IDXS_LST)
 FCW_IDXS = T_IDXS < 5.0
 T_DIFFS = np.diff(T_IDXS, prepend=[0.])
 COMFORT_BRAKE = 2.5
-STOP_DISTANCE = 4.0
+STOP_DISTANCE = 6.0
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 1.6
 
@@ -68,16 +68,29 @@ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
+def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, v_ego=0.0):
+  """
+  動態跟車時間：
+  - 高速時保持較大間距
+  - 低速 / 塞車時縮短間距
+  - personality 仍然有效：relaxed > standard > aggressive
+  """
 
-def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
-  if personality==log.LongitudinalPersonality.relaxed:
-    return 1.45
-  elif personality==log.LongitudinalPersonality.standard:
-    return 1.25
-  elif personality==log.LongitudinalPersonality.aggressive:
-    return 1.05
+  if personality == log.LongitudinalPersonality.relaxed:
+    base_t = 1.6
+  elif personality == log.LongitudinalPersonality.standard:
+    base_t = 1.3
+  elif personality == log.LongitudinalPersonality.aggressive:
+    base_t = 1.0
   else:
     raise NotImplementedError("Longitudinal personality not supported")
+
+  if v_ego < 5:   # 18 km/h 以下
+    return base_t * 0.6
+  elif v_ego < 10:   # 36 km/h 以下
+    return base_t * 0.7
+
+  return base_t
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)
@@ -87,9 +100,18 @@ def get_safe_obstacle_distance(v_ego, t_follow):
 
 def desired_follow_distance(v_ego, v_lead, t_follow=None):
   if t_follow is None:
-    t_follow = get_T_FOLLOW()
-  return get_safe_obstacle_distance(v_ego, t_follow) - get_stopped_equivalence_factor(v_lead)
+    t_follow = get_T_FOLLOW(v_ego=v_ego)
 
+  # 動態調整 STOP_DISTANCE：低速時縮短最小距離
+  if v_ego < 5:
+    stop_dist = 3.0   # 塞車時 3 公尺
+  elif v_ego < 10:
+    stop_dist = 4.5   # 市區低速 4.5 公尺
+  else:
+    stop_dist = 6.0   # 高速保持原本 6 公尺
+
+  safe_dist = (v_ego**2) / (2 * COMFORT_BRAKE) + t_follow * v_ego + stop_dist
+  return safe_dist - get_stopped_equivalence_factor(v_lead)
 
 def gen_long_model():
   model = AcadosModel()
