@@ -56,7 +56,7 @@ class Controls(ControlsExt, ModelStateBase):
     self.curvature = 0.0
     self.desired_curvature = 0.0
     self.acm = ACM()
-    self.acm.enabled = Params().get_bool("ACMEnabled")
+    self.acm.enabled = True
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
 
