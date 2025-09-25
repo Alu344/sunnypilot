@@ -74,7 +74,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.solverExecutionTime = 0.0
 
     self.acm = ACM()   # 建立 ACM 物件
-    self.acm.enabled = Params().get_bool("ACMEnabled")  # 從 params 控制開關
+    self.acm.enabled = True 
 
   @staticmethod
   def parse_model(model_msg):
