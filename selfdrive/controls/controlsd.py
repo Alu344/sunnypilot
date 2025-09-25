@@ -19,7 +19,6 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
-from openpilot.selfdrive.controls.lib.acm import ACM
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
@@ -55,8 +54,7 @@ class Controls(ControlsExt, ModelStateBase):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
-    self.acm = ACM()
-    self.acm.enabled = True
+
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
 
