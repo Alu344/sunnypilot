@@ -85,7 +85,9 @@ def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard, v_ego=0.0):
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
-  if v_ego < 5:   # 18 km/h 以下
+  if v_ego == 0:
+    return base_t
+  elif v_ego < 5:   # 18 km/h 以下
     return base_t * 0.6
   elif v_ego < 10:   # 36 km/h 以下
     return base_t * 0.7
@@ -342,7 +344,7 @@ class LongitudinalMpc:
 
     # MPC will not converge if immediate crash is expected
     # Clip lead distance to what is still possible to brake for
-    min_x_lead = ((v_ego + v_lead)/2) * (v_ego - v_lead) / (-ACCEL_MIN * 2)
+    min_x_lead = max(0.0, ((v_ego + v_lead)/2) * (v_ego - v_lead) / (-ACCEL_MIN * 2))
     x_lead = np.clip(x_lead, min_x_lead, 1e8)
     v_lead = np.clip(v_lead, 0.0, 1e8)
     a_lead = np.clip(a_lead, -10., 5.)
@@ -350,12 +352,14 @@ class LongitudinalMpc:
     return lead_xv
 
   def update(self, radarstate, v_cruise, x, v, a, j, personality=log.LongitudinalPersonality.standard):
-    t_follow = get_T_FOLLOW(personality)
     v_ego = self.x0[1]
-    self.status = radarstate.leadOne.status or radarstate.leadTwo.status
-
-    lead_xv_0 = self.process_lead(radarstate.leadOne)
-    lead_xv_1 = self.process_lead(radarstate.leadTwo)
+    t_follow = get_T_FOLLOW(personality, v_ego=v_ego)
+    
+    lead1 = getattr(radarstate, "leadOne", None) if radarstate is not None else None
+    lead2 = getattr(radarstate, "leadTwo", None) if radarstate is not None else None
+    self.status = (lead1 and lead1.status) or (lead2 and lead2.status)
+    lead_xv_0 = self.process_lead(lead1)
+    lead_xv_1 = self.process_lead(lead2)
 
     # To estimate a safe distance from a moving lead, we calculate how much stopping
     # distance that lead needs as a minimum. We can add that to the current distance
@@ -382,8 +386,8 @@ class LongitudinalMpc:
       x_obstacles = np.column_stack([lead_0_obstacle, lead_1_obstacle, cruise_obstacle])
       self.source = SOURCES[np.argmin(x_obstacles[0])]
 
-      # These are not used in ACC mode
-      x[:], v[:], a[:], j[:] = 0.0, 0.0, 0.0, 0.0
+      # These are not used in ACC mode; ensure array shapes even if caller passed scalars
+      x = np.zeros(N+1); v = np.zeros(N+1); a = np.zeros(N+1); j = np.zeros(N)
 
     elif self.mode == 'blended':
       self.params[:,5] = 1.0
