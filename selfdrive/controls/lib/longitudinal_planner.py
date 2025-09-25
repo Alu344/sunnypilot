@@ -34,20 +34,16 @@ def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
 
 def get_coast_accel(pitch):
-  return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
+  return np.sin(pitch) * -5.65 - 0.3  # fitted from data
 
 
 def limit_accel_in_turns(v_ego, angle_steers, a_target, CP):
   """
-  This function returns a limited long acceleration allowed, depending on the existing lateral acceleration
-  this should avoid accelerating when losing the target in turns
+  Limit longitudinal accel based on lateral accel
   """
-  # FIXME: This function to calculate lateral accel is incorrect and should use the VehicleModel
-  # The lookup table for turns should also be updated if we do this
   a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
   a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
   a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
-
   return [a_target[0], min(a_target[1], a_x_allowed)]
 
 
@@ -55,7 +51,6 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
   def __init__(self, CP, init_v=0.0, init_a=0.0, dt=DT_MDL):
     self.CP = CP
     self.mpc = LongitudinalMpc(dt=dt)
-    # TODO remove mpc modes when TR released
     self.mpc.mode = 'acc'
     LongitudinalPlannerSP.__init__(self, self.CP, self.mpc)
     self.fcw = False
@@ -73,8 +68,8 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.j_desired_trajectory = np.zeros(CONTROL_N)
     self.solverExecutionTime = 0.0
 
-    self.acm = ACM()   # 建立 ACM 物件
-    self.acm.enabled = True 
+    self.acm = ACM()
+    self.acm.enabled = True
 
   @staticmethod
   def parse_model(model_msg):
@@ -109,7 +104,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if len(sm['carControl'].orientationNED) == 3:
       accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
     else:
-      accel_coast = ACCEL_MAX
+      accel_coast = 0.0  # fallback
 
     v_ego = sm['carState'].vEgo
     v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
@@ -119,22 +114,17 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
     force_slow_decel = sm['controlsState'].forceDecel
 
-    # Reset current state when not engaged, or user is controlling the speed
     reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
-    # PCM cruise speed may be updated a few cycles later, check if initialized
     reset_state = reset_state or not v_cruise_initialized
 
-    # No change cost when user is controlling the speed, or when standstill
     prev_accel_constraint = not (reset_state or sm['carState'].standstill)
-    
-    # Update ACM status
+
     if not sm['selfdriveState'].experimentalMode:
-      if not self.acm.enabled:
-        self.acm.enabled = True
-        self.acm.downhill_only = False
+      self.acm.enabled = True
+      self.acm.downhill_only = False
     else:
       self.acm.enabled = False
-      
+
     user_control = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
     self.acm.update_states(sm['carControl'], sm['radarState'], user_control, v_ego, v_cruise)
 
@@ -142,26 +132,27 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       accel_clip = [ACCEL_MIN, get_max_accel(v_ego)]
       steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['liveParameters'].angleOffsetDeg
       accel_clip = limit_accel_in_turns(v_ego, steer_angle_without_offset, accel_clip, self.CP)
+      accel_clip = [min(accel_clip[0], accel_clip[1]), max(accel_clip[0], accel_clip[1])]
     else:
       accel_clip = [ACCEL_MIN, ACCEL_MAX]
 
     if reset_state:
       self.v_desired_filter.x = v_ego
-      # Clip aEgo to cruise limits to prevent large accelerations when becoming active
       self.a_desired = np.clip(sm['carState'].aEgo, accel_clip[0], accel_clip[1])
+      self.mpc.reset()
+      self.prev_accel_clip = accel_clip.copy()
 
-    # Prevent divergence, smooth in current v_ego
     self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
     x, v, a, j, throttle_prob = self.parse_model(sm['modelV2'])
-    # Don't clip at low speeds since throttle_prob doesn't account for creep
     self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
 
     if not self.allow_throttle:
       clipped_accel_coast = max(accel_coast, accel_clip[0])
-      clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [accel_clip[1], clipped_accel_coast])
+      clipped_accel_coast_interp = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2],
+                                             [accel_clip[1], clipped_accel_coast])
       accel_clip[1] = min(accel_clip[1], clipped_accel_coast_interp)
+      accel_clip = [min(accel_clip[0], accel_clip[1]), max(accel_clip[0], accel_clip[1])]
 
-    # Get new v_cruise and a_desired from Smart Cruise Control
     v_cruise, self.a_desired = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.a_desired, v_cruise)
 
     if force_slow_decel:
@@ -174,21 +165,21 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.v_solution)
     self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, self.mpc.a_solution)
     self.j_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC[:-1], self.mpc.j_solution)
-    
+
     self.a_desired_trajectory = self.acm.update_a_desired_trajectory(self.a_desired_trajectory)
-    # TODO counter is only needed because radar is glitchy, remove once radar is gone
     self.fcw = self.mpc.crash_cnt > 2 and not sm['carState'].standstill
     if self.fcw:
       cloudlog.info("FCW triggered")
 
-    # Interpolate 0.05 seconds and save as starting point for next iteration
     a_prev = self.a_desired
     self.a_desired = float(np.interp(self.dt, CONTROL_N_T_IDX, self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.a_desired + a_prev) / 2.0
 
-    action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
-    output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
-                                                                        action_t=action_t, vEgoStopping=self.CP.vEgoStopping)
+    action_t = self.CP.longitudinalActuatorDelay + DT_MDL
+    output_a_target_mpc, output_should_stop_mpc = get_accel_from_plan(
+      self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
+      action_t=action_t, vEgoStopping=self.CP.vEgoStopping
+    )
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
 
@@ -199,11 +190,14 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       output_a_target = min(output_a_target_mpc, output_a_target_e2e)
       self.output_should_stop = output_should_stop_e2e or output_should_stop_mpc
 
-    # Apply ACM to the final output acceleration target as well
     output_a_target = self.acm.update_output_a_target(output_a_target)
 
+    clip_slew_rate = 2.0 * self.dt
     for idx in range(2):
-      accel_clip[idx] = np.clip(accel_clip[idx], self.prev_accel_clip[idx] - 0.05, self.prev_accel_clip[idx] + 0.05)
+      accel_clip[idx] = np.clip(accel_clip[idx],
+                                self.prev_accel_clip[idx] - clip_slew_rate,
+                                self.prev_accel_clip[idx] + clip_slew_rate)
+
     self.output_a_target = np.clip(output_a_target, accel_clip[0], accel_clip[1])
     self.prev_accel_clip = accel_clip
 
@@ -221,7 +215,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     longitudinalPlan.accels = self.a_desired_trajectory.tolist()
     longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
 
-    longitudinalPlan.hasLead = sm['radarState'].leadOne.status
+    rs = sm['radarState'] if 'radarState' in sm and sm['radarState'] is not None else None
+    has_lead = False
+    if rs is not None:
+      lead1 = getattr(rs, 'leadOne', None)
+      has_lead = bool(getattr(lead1, 'status', False))
+    longitudinalPlan.hasLead = has_lead
+
     longitudinalPlan.longitudinalPlanSource = self.mpc.source
     longitudinalPlan.fcw = self.fcw
 
@@ -233,3 +233,4 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     pm.send('longitudinalPlan', plan_send)
 
     self.publish_longitudinal_plan_sp(sm, pm)
+
