@@ -1,121 +1,153 @@
-"""
-Copyright (c) 2025, Rick Lan
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, and/or sublicense, 
-for non-commercial purposes only, subject to the following conditions:
-
-- The above copyright notice and this permission notice shall be included in 
-  all copies or substantial portions of the Software.
-- Commercial use (e.g. use in a product, service, or activity intended to 
-  generate revenue) is prohibited without explicit written permission from 
-  the copyright holder.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-"""
-
 import numpy as np
 
-SLOPE = -0.04
-RATIO = 0.9
+# --- Hysteresis & thresholds ---
+# 下坡判定：sin(pitch) < SLOPE，加入遲滯避免抖動
+SLOPE = -0.04         # 約 -2.3°
+SLOPE_HYST = 0.01     # 約 ±0.6° 的 sin 範圍
 
+# 超過巡航判定：ON/OFF 分開，降低邊界抖動
+RATIO_ON = 0.90
+RATIO_OFF = 0.88
+
+# 啟動速度門檻（避免超低速啟用 ACM）
+MIN_SPEED_ON_MPS = 1.4   # ≈ 5 km/h
+MIN_SPEED_OFF_MPS = 1.2  # ≈ 4.3 km/h（遲滯）
+
+# 允許煞車量與 TTC 映射（x 軸需遞增）
 TTC = 3.5
-TTC_BP = [TTC, 2.5]                # Time-to-collision breakpoints
-MIN_BRAKE_ALLOW_VALS = [0., -0.5]  # Allowed braking at each TTC point
+TTC_BP = [2.5, TTC]               # 2.5s → 3.5s
+MIN_BRAKE_ALLOW_VALS = [-0.5, 0.] # 小 TTC 允許更多（更負）的煞車；大 TTC 允許 0
+
+# TTC 去抖（需要連續幾幀才算有/沒有前車威脅）
+TTC_ON_FRAMES = 3   # 連續 < TTC 幀數 → 觸發有威脅
+TTC_OFF_FRAMES = 6  # 連續 ≥ TTC 幀數 → 解除威脅
 
 class ACM:
   def __init__(self):
     self.enabled = False
     self.downhill_only = False
-    self.suppress_accel = True  # toggle: suppress throttle (full coasting)
+    self.suppress_accel = True  # True: 抑制油門（全滑行）
 
     self._is_downhill = False
     self._is_speed_over_cruise = False
     self._has_lead = False
     self._active_prev = False
 
+    # TTC 去抖用
+    self._ttc_on_ctr = 0
+    self._ttc_off_ctr = 0
+
     self.active = False
-    self.just_enabled = False    # NEW
+    self.just_enabled = False
     self.just_disabled = False
-    self.allowed_brake_val = 0.
+    self.allowed_brake_val = 0.0
     self.lead_ttc = float('inf')
+
+  def _reset_edge_flags(self):
+    self.just_enabled = False
+    self.just_disabled = False
 
   def update_states(self, cs, rs, user_ctrl_lon, v_ego, v_cruise):
     self.lead_ttc = float('inf')
+    self._reset_edge_flags()
 
+    # 未啟用 → 全關
     if not self.enabled:
       self.active = False
-      self.just_enabled = False
-      self.just_disabled = False
+      self._active_prev = False
       return
 
-    if len(cs.orientationNED) != 3:
+    # 缺 orientation → 全關（無法判斷坡度）
+    if not hasattr(cs, "orientationNED") or len(cs.orientationNED) != 3:
       self.active = False
-      self.just_enabled = False
-      self.just_disabled = False
+      self._active_prev = False
       return
 
+    # --- Downhill hysteresis ---
     pitch_rad = cs.orientationNED[1]
-    self._is_downhill = np.sin(pitch_rad) < SLOPE
-    self._is_speed_over_cruise = v_ego > (v_cruise * RATIO)
+    s = float(np.sin(pitch_rad))
+    if s < (SLOPE - SLOPE_HYST):
+      self._is_downhill = True
+    elif s > (SLOPE + SLOPE_HYST):
+      self._is_downhill = False
 
-    lead = rs.leadOne
-    if lead and lead.status:
-      # More accurate TTC if relative velocity available
-      if hasattr(lead, "vRel") and lead.vRel < 0:  # approaching lead
-        self.lead_ttc = lead.dRel / (-lead.vRel) if lead.vRel != 0 else float('inf')
+    # --- Over-cruise hysteresis ---
+    if v_ego > (v_cruise * RATIO_ON):
+      self._is_speed_over_cruise = True
+    elif v_ego < (v_cruise * RATIO_OFF):
+      self._is_speed_over_cruise = False
+
+    # --- Lead TTC with debouncing ---
+    lead = getattr(rs, "leadOne", None) if rs is not None else None
+    has_lead_raw = False
+    if lead is not None and getattr(lead, "status", False):
+      v_rel = getattr(lead, "vRel", None)
+      d_rel = max(0.0, float(getattr(lead, "dRel", 0.0)))
+      if v_rel is not None and v_rel < 0.0:  # 正在接近
+        eps = 1e-3
+        self.lead_ttc = (d_rel / (-v_rel)) if abs(v_rel) > eps else float('inf')
       else:
         self.lead_ttc = float('inf')
-
-      self._has_lead = self.lead_ttc < TTC
+      has_lead_raw = (self.lead_ttc < TTC)
     else:
-      self._has_lead = False
+      self.lead_ttc = float('inf')
+      has_lead_raw = False
 
-    # Determine active state
+    # 去抖：連續幀判斷
+    if has_lead_raw:
+      self._ttc_on_ctr = min(self._ttc_on_ctr + 1, TTC_ON_FRAMES)
+      self._ttc_off_ctr = 0
+      if self._ttc_on_ctr >= TTC_ON_FRAMES:
+        self._has_lead = True
+    else:
+      self._ttc_off_ctr = min(self._ttc_off_ctr + 1, TTC_OFF_FRAMES)
+      self._ttc_on_ctr = 0
+      if self._ttc_off_ctr >= TTC_OFF_FRAMES:
+        self._has_lead = False
+
+    # 允許的（不被抑制的）最大煞車（非正值）
+    self.allowed_brake_val = float(np.interp(self.lead_ttc, TTC_BP, MIN_BRAKE_ALLOW_VALS))
+    self.allowed_brake_val = min(0.0, self.allowed_brake_val)
+
+    # --- Min speed hysteresis for ACM activation ---
+    above_min_speed = (v_ego > MIN_SPEED_ON_MPS) if not self.active else (v_ego > MIN_SPEED_OFF_MPS)
+
+    # 判斷是否進入 ACM
     self.active = (
       not user_ctrl_lon
+      and above_min_speed
       and not self._has_lead
       and self._is_speed_over_cruise
       and (self._is_downhill if self.downhill_only else True)
     )
 
     # Edge detection
-    self.just_enabled = not self._active_prev and self.active
-    self.just_disabled = self._active_prev and not self.active
+    if not self._active_prev and self.active:
+      self.just_enabled = True
+    elif self._active_prev and not self.active:
+      self.just_disabled = True
     self._active_prev = self.active
-
-    # Interpolate allowed braking based on TTC
-    self.allowed_brake_val = float(
-      np.interp(self.lead_ttc, TTC_BP, MIN_BRAKE_ALLOW_VALS)
-    )
 
   def update_a_desired_trajectory(self, a_desired_trajectory):
     if not self.active:
       return a_desired_trajectory
 
-    for i in range(len(a_desired_trajectory)):
-      # Suppress mild braking
-      if a_desired_trajectory[i] < 0 and a_desired_trajectory[i] > self.allowed_brake_val:
-        a_desired_trajectory[i] = 0.0
-
-      # Suppress acceleration if enabled
-      if self.suppress_accel and a_desired_trajectory[i] > 0:
-        a_desired_trajectory[i] = 0.0
-
-    return a_desired_trajectory
+    arr = np.array(a_desired_trajectory, dtype=float, copy=True)
+    # 抑制輕微煞車（介於 allowed_brake_val ~ 0）
+    mask_soft_brake = (arr < 0.0) & (arr > self.allowed_brake_val)
+    arr[mask_soft_brake] = 0.0
+    # 抑制加速（若開啟）
+    if self.suppress_accel:
+      arr[arr > 0.0] = 0.0
+    return arr.tolist()
 
   def update_output_a_target(self, output_a_target):
     if not self.active:
       return output_a_target
-
-    # Suppress mild braking
-    if output_a_target < 0 and output_a_target > self.allowed_brake_val:
+    # 抑制輕微煞車
+    if output_a_target < 0.0 and output_a_target > self.allowed_brake_val:
       output_a_target = 0.0
-
-    # Suppress acceleration if enabled
-    if self.suppress_accel and output_a_target > 0:
+    # 抑制加速（若開啟）
+    if self.suppress_accel and output_a_target > 0.0:
       output_a_target = 0.0
-
     return output_a_target
