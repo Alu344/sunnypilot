@@ -12,14 +12,7 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 
 def long_control_state_trans(CP, active, long_control_state, v_ego,
                              should_stop, brake_pressed, cruise_standstill):
-  """
-  狀態轉換邏輯：
-  - off → stopping: 沒有起步條件或強制停止
-  - stopping → starting/pid: 有起步條件
-  - starting/pid → stopping: 停止條件
-  """
-  # 加入速度條件，避免高速時誤判進 stopping
-  stopping_condition = should_stop or (v_ego < CP.vEgoStopping and brake_pressed)
+  stopping_condition = should_stop
   starting_condition = (not should_stop and
                         not cruise_standstill and
                         not brake_pressed)
@@ -51,7 +44,6 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
         long_control_state = LongCtrlState.pid
   return long_control_state
 
-
 class LongControl:
   def __init__(self, CP):
     self.CP = CP
@@ -65,35 +57,32 @@ class LongControl:
     self.pid.reset()
 
   def update(self, active, CS, a_target, should_stop, accel_limits):
-    """更新縱向控制：狀態機 + PID 控制"""
+    """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
                                                        CS.cruiseState.standstill)
-
     if self.long_control_state == LongCtrlState.off:
       self.reset()
-      output_accel = 0.0
+      output_accel = 0.
 
     elif self.long_control_state == LongCtrlState.stopping:
-      # 漸進減速，直到 stopAccel（通常是負數，例如 -1.2 m/s²）
-      output_accel = max(self.last_output_accel - self.CP.stoppingDecelRate * DT_CTRL,
-                         self.CP.stopAccel)
+      output_accel = self.last_output_accel
+      if output_accel > self.CP.stopAccel:
+        output_accel = min(output_accel, 0.0)
+        output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
-      # 起步時給一個 bias，加上 PID 控制
-      error = a_target - CS.aEgo
-      pid_out = self.pid.update(error, speed=CS.vEgo, feedforward=a_target)
-      output_accel = pid_out + self.CP.startAccel
+      output_accel = self.CP.startAccel
+      self.reset()
 
     else:  # LongCtrlState.pid
       error = a_target - CS.aEgo
       output_accel = self.pid.update(error, speed=CS.vEgo,
                                      feedforward=a_target)
 
-    # 輸出加速度限制在 accel_limits 範圍內
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel
